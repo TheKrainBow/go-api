@@ -127,9 +127,6 @@ func requestToken(config APIClientInput) (*TokenResponse, error) {
 	if config.AuthType == AuthTypePassword {
 		data.Set("username", config.Username)
 		data.Set("password", config.Password)
-	} else if config.AuthType == AuthTypeClientCredentials {
-		data.Set("client_id", config.ClientID)
-		data.Set("client_secret", config.ClientSecret)
 	}
 
 	req, err := http.NewRequest("POST", config.TokenURL, strings.NewReader(data.Encode()))
@@ -138,7 +135,7 @@ func requestToken(config APIClientInput) (*TokenResponse, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	if config.ClientID != "" && config.ClientSecret != "" {
+	if config.AuthType != AuthTypeBasic {
 		req.Header.Set("Authorization", basicAuthHeader(config.ClientID, config.ClientSecret))
 	}
 
