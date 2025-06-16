@@ -79,7 +79,7 @@ func (dt *debugTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		if req.Body != nil {
 			bodyBytes, _ := io.ReadAll(req.Body)
-			fmt.Printf("  Body: %s\n", string(bodyBytes))
+			fmt.Printf("   Body: %s\n", string(bodyBytes))
 			// Need to restore body because it's read-once
 			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
