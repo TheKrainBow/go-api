@@ -1,6 +1,7 @@
 package apiManager
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -35,6 +36,7 @@ type APIClientInput struct {
 	Username     string
 	Password     string
 	Scope        string
+	Debug        bool
 }
 
 type APIClient struct {
@@ -59,6 +61,51 @@ type authTransport struct {
 	underlyingTransport http.RoundTripper
 	token               string
 	refreshFunc         func() (string, error) // Function to refresh the token
+}
+
+type debugTransport struct {
+	underlying http.RoundTripper
+	enabled    bool
+}
+
+func (dt *debugTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if dt.enabled {
+		// Log Request
+		fmt.Printf("➡️ REQUEST: %s %s\n", req.Method, req.URL)
+		for name, values := range req.Header {
+			for _, value := range values {
+				fmt.Printf("  %s: %s\n", name, value)
+			}
+		}
+		if req.Body != nil {
+			bodyBytes, _ := io.ReadAll(req.Body)
+			fmt.Printf("  Body: %s\n", string(bodyBytes))
+			// Need to restore body because it's read-once
+			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+	}
+
+	resp, err := dt.underlying.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if dt.enabled {
+		// Log Response
+		fmt.Printf("⬅️ RESPONSE: %d %s\n", resp.StatusCode, resp.Status)
+		for name, values := range resp.Header {
+			for _, value := range values {
+				fmt.Printf("  %s: %s\n", name, value)
+			}
+		}
+		if resp.Body != nil {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			fmt.Printf("  Body: %s\n", string(bodyBytes))
+			resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+	}
+
+	return resp, nil
 }
 
 func init() {
@@ -202,8 +249,11 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 	newClient = &APIClient{}
 	newClient.client = &http.Client{
 		Transport: &authTransport{
-			underlyingTransport: http.DefaultTransport,
-			token:               tokenResp.AccessToken,
+			underlyingTransport: &debugTransport{
+				underlying: http.DefaultTransport,
+				enabled:    config.Debug,
+			},
+			token: tokenResp.AccessToken,
 			refreshFunc: func() (string, error) {
 				// Refresh the token
 				newTokenResp, err := requestToken(config)
@@ -222,7 +272,7 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 	newClient.Scope = config.Scope
 	newClient.Endpoint = config.Endpoint
 	newClient.TokenURL = config.TokenURL
-	newClient.Debug = false
+	newClient.Debug = config.Debug
 	clients[name] = newClient
 	return newClient, nil
 }
@@ -238,20 +288,31 @@ func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 	}
 	var resp *http.Response
 	var err error
-	for range 5 {
+	for i := range 5 {
 		resp, err = ft.client.Do(rq)
 		if err != nil {
 			return nil, err
 		}
-		if resp.StatusCode != http.StatusTooManyRequests {
-			return resp, nil
-		}
-		delay, err := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64)
-		if err != nil {
-			time.Sleep(time.Second * 2)
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			delay, err := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64)
+			if err != nil {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			time.Sleep(time.Duration(delay) * time.Second)
 			continue
 		}
-		time.Sleep(time.Second * time.Duration(delay))
+
+		if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable {
+			if ft.Debug {
+				log.Printf("Retry %d with status %s\n", i, resp.Status)
+			}
+			time.Sleep(2 * time.Second)
+			continue
+		} else if ft.Debug {
+			log.Printf("Success in %d tries with status %s\n", i, resp.Status)
+		}
 	}
 	return nil, fmt.Errorf("retried 5 times and still failed")
 }
