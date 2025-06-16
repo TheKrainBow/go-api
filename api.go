@@ -139,7 +139,7 @@ func requestToken(config APIClientInput) (*TokenResponse, error) {
 		req.Header.Set("Authorization", basicAuthHeader(config.ClientID, config.ClientSecret))
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -236,8 +236,10 @@ func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 	if ft.authType == AuthTypeBasic {
 		rq.SetBasicAuth(ft.Username, ft.Password)
 	}
-	for {
-		resp, err := ft.client.Do(rq)
+	var resp *http.Response
+	var err error
+	for range 5 {
+		resp, err = ft.client.Do(rq)
 		if err != nil {
 			return nil, err
 		}
@@ -251,4 +253,5 @@ func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 		}
 		time.Sleep(time.Second * time.Duration(delay))
 	}
+	return nil, fmt.Errorf("retried 5 times and still failed")
 }
