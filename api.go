@@ -117,7 +117,7 @@ func (client *APIClient) TestConnection() error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("invalid status: %s", resp.Status)
+		return fmt.Errorf("connection test on %s failed with a '%s'", client.TestPath, resp.Status)
 	}
 	return nil
 }
