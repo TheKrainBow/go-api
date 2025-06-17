@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -70,7 +69,6 @@ type debugTransport struct {
 
 func (dt *debugTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if dt.enabled {
-		// Log Request
 		fmt.Printf("➡️ REQUEST: %s %s\n", req.Method, req.URL)
 		for name, values := range req.Header {
 			for _, value := range values {
@@ -80,7 +78,6 @@ func (dt *debugTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if req.Body != nil {
 			bodyBytes, _ := io.ReadAll(req.Body)
 			fmt.Printf("   Body: %s\n", string(bodyBytes))
-			// Need to restore body because it's read-once
 			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
 	}
@@ -119,30 +116,40 @@ func (client *APIClient) TestConnection() error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("invalid status: %s", resp.Status)
+	}
 	return nil
 }
 
 func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Add the Authorization header
-	req.Header.Set("Authorization", "Bearer "+t.token)
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
 
-	// Make the request
+	req.Header.Set("Authorization", "Bearer "+t.token)
 	resp, err := t.underlyingTransport.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
 
-	// If the token is expired, try to refresh and retry the request
 	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+
 		newToken, err := t.refreshFunc()
 		if err != nil {
-			return nil, fmt.Errorf("failed to refresh token: %w", err)
+			return nil, fmt.Errorf("token refresh failed: %w", err)
 		}
-
-		// Update the token and retry the request
 		t.token = newToken
+
+		// Rewind body for retry
+		if bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
 		req.Header.Set("Authorization", "Bearer "+t.token)
-		resp.Body.Close() // Close the previous response body
+
 		return t.underlyingTransport.RoundTrip(req)
 	}
 
@@ -246,23 +253,27 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 	if err != nil {
 		return nil, err
 	}
+
 	newClient = &APIClient{}
+
+	transport := &authTransport{}
+
+	transport.underlyingTransport = &debugTransport{
+		underlying: http.DefaultTransport,
+		enabled:    config.Debug,
+	}
+	transport.token = tokenResp.AccessToken
+	transport.refreshFunc = func() (string, error) {
+		newTokenResp, err := requestToken(config)
+		if err != nil {
+			return "", err
+		}
+		transport.token = newTokenResp.AccessToken
+		return newTokenResp.AccessToken, nil
+	}
+
 	newClient.client = &http.Client{
-		Transport: &authTransport{
-			underlyingTransport: &debugTransport{
-				underlying: http.DefaultTransport,
-				enabled:    config.Debug,
-			},
-			token: tokenResp.AccessToken,
-			refreshFunc: func() (string, error) {
-				// Refresh the token
-				newTokenResp, err := requestToken(config)
-				if err != nil {
-					return "", err
-				}
-				return newTokenResp.AccessToken, nil
-			},
-		},
+		Transport: transport,
 	}
 	newClient.authType = config.AuthType
 	newClient.ClientID = config.ClientID
@@ -273,6 +284,7 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 	newClient.Endpoint = config.Endpoint
 	newClient.TokenURL = config.TokenURL
 	newClient.Debug = config.Debug
+	newClient.TestPath = config.TestPath
 	clients[name] = newClient
 	return newClient, nil
 }
@@ -280,39 +292,27 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 func GetClient(name string) *APIClient {
 	return clients[name]
 }
-
 func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 	rq.Header.Set("Content-Type", "application/json")
 	if ft.authType == AuthTypeBasic {
 		rq.SetBasicAuth(ft.Username, ft.Password)
 	}
-	var resp *http.Response
-	var err error
-	for i := range 5 {
-		resp, err = ft.client.Do(rq)
-		if err != nil {
-			return nil, err
-		}
 
-		if resp.StatusCode == http.StatusTooManyRequests {
-			delay, err := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64)
-			if err != nil {
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			time.Sleep(time.Duration(delay) * time.Second)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable {
-			if ft.Debug {
-				log.Printf("Retry %d with status %s\n", i, resp.Status)
-			}
-			time.Sleep(2 * time.Second)
-			continue
-		} else if ft.Debug {
-			log.Printf("Success in %d tries with status %s\n", i, resp.Status)
-		}
+	// Reset body once before sending (authTransport will handle cloning again if needed)
+	var bodyBytes []byte
+	if rq.Body != nil {
+		bodyBytes, _ = io.ReadAll(rq.Body)
+		rq.Body.Close()
+		rq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
-	return nil, fmt.Errorf("retried 5 times and still failed")
+
+	resp, err := ft.client.Do(rq)
+	if err != nil {
+		return nil, err
+	}
+
+	if ft.Debug {
+		log.Printf("do() received status %s\n", resp.Status)
+	}
+	return resp, nil
 }
