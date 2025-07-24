@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,6 +36,7 @@ type APIClientInput struct {
 	Username     string
 	Password     string
 	Scope        string
+	SleepTime    int
 	Debug        bool
 }
 
@@ -47,6 +49,7 @@ type APIClient struct {
 	Username     string
 	Password     string
 	Scope        string
+	SleepTime    int // Sleep time between requests in ms
 
 	authType AuthType
 	client   *http.Client
@@ -153,6 +156,27 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.underlyingTransport.RoundTrip(req)
 	}
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		resp.Body.Close()
+
+		retryAfter := time.Second * 1 // default fallback
+		if val := resp.Header.Get("Retry-After"); val != "" {
+			if secs, err := strconv.Atoi(val); err == nil {
+				retryAfter = time.Duration(secs) * time.Second
+			}
+		}
+
+		// fmt.Printf("Too Many Requests. waiting %0.0f seconds\n", retryAfter.Seconds())
+		time.Sleep(retryAfter)
+		// Rewind body
+		if bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+		req.Header.Set("Authorization", "Bearer "+t.token)
+
+		return t.underlyingTransport.RoundTrip(req)
+	}
+
 	return resp, nil
 }
 
@@ -226,7 +250,7 @@ func requestToken(config APIClientInput) (*TokenResponse, error) {
 	return &tokenResp, nil
 }
 
-func NewBasicAPIClient(name string, username string, password string, endpoint string, testPath string, unsecure bool) (newClient *APIClient, err error) {
+func NewBasicAPIClient(name string, username string, password string, endpoint string, testPath string, sleepTime int, unsecure bool) (newClient *APIClient, err error) {
 	newClient = &APIClient{}
 	newClient.client = &http.Client{}
 	if unsecure {
@@ -239,6 +263,7 @@ func NewBasicAPIClient(name string, username string, password string, endpoint s
 	newClient.Password = password
 	newClient.Endpoint = endpoint
 	newClient.TestPath = testPath
+	newClient.SleepTime = sleepTime
 	newClient.Debug = false
 	clients[name] = newClient
 	return newClient, nil
@@ -246,7 +271,7 @@ func NewBasicAPIClient(name string, username string, password string, endpoint s
 
 func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err error) {
 	if config.AuthType == AuthTypeBasic {
-		return NewBasicAPIClient(name, config.Username, config.Password, config.Endpoint, config.TestPath, true)
+		return NewBasicAPIClient(name, config.Username, config.Password, config.Endpoint, config.TestPath, config.SleepTime, true)
 	}
 	// Request the initial token
 	tokenResp, err := requestToken(config)
@@ -284,6 +309,7 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 	newClient.Endpoint = config.Endpoint
 	newClient.TokenURL = config.TokenURL
 	newClient.Debug = config.Debug
+	newClient.SleepTime = config.SleepTime
 	newClient.TestPath = config.TestPath
 	clients[name] = newClient
 	return newClient, nil
@@ -292,13 +318,13 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 func GetClient(name string) *APIClient {
 	return clients[name]
 }
+
 func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 	rq.Header.Set("Content-Type", "application/json")
 	if ft.authType == AuthTypeBasic {
 		rq.SetBasicAuth(ft.Username, ft.Password)
 	}
 
-	// Reset body once before sending (authTransport will handle cloning again if needed)
 	var bodyBytes []byte
 	if rq.Body != nil {
 		bodyBytes, _ = io.ReadAll(rq.Body)
@@ -306,7 +332,17 @@ func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 		rq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
+	start := time.Now()
 	resp, err := ft.client.Do(rq)
+	elapsed := time.Since(start)
+
+	if ft.SleepTime > 0 {
+		target := time.Duration(ft.SleepTime) * time.Millisecond
+		if elapsed < target {
+			time.Sleep(target - elapsed)
+		}
+	}
+
 	if err != nil {
 		return nil, err
 	}
