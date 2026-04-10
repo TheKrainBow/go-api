@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -55,6 +58,13 @@ type APIClient struct {
 }
 
 var clients map[string]*APIClient
+
+const (
+	maxRetryAttempts    = 4
+	retryBaseDelay      = 500 * time.Millisecond
+	retryMaxDelay       = 8 * time.Second
+	retryJitterFraction = 0.2
+)
 
 type authTransport struct {
 	underlyingTransport http.RoundTripper
@@ -107,6 +117,7 @@ func (dt *debugTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func init() {
 	clients = make(map[string]*APIClient)
+	rand.Seed(time.Now().UnixNano())
 }
 
 func (client *APIClient) TestConnection() error {
@@ -292,6 +303,76 @@ func NewAPIClient(name string, config APIClientInput) (newClient *APIClient, err
 func GetClient(name string) *APIClient {
 	return clients[name]
 }
+
+func cloneRequestForAttempt(req *http.Request, bodyBytes []byte) *http.Request {
+	cloned := req.Clone(req.Context())
+	cloned.Header = req.Header.Clone()
+	if bodyBytes != nil {
+		cloned.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		cloned.ContentLength = int64(len(bodyBytes))
+	}
+	return cloned
+}
+
+func shouldRetryStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(trimmed); err == nil {
+		if secs < 0 {
+			return 0, true
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	retryAt, err := http.ParseTime(trimmed)
+	if err != nil {
+		return 0, false
+	}
+	delay := retryAt.Sub(now)
+	if delay < 0 {
+		return 0, true
+	}
+	return delay, true
+}
+
+func retryDelay(resp *http.Response, attempt int) time.Duration {
+	if resp != nil {
+		if delay, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+			if delay > retryMaxDelay {
+				return retryMaxDelay
+			}
+			return delay
+		}
+	}
+
+	backoff := float64(retryBaseDelay) * math.Pow(2, float64(attempt))
+	if backoff > float64(retryMaxDelay) {
+		backoff = float64(retryMaxDelay)
+	}
+
+	jitterWindow := time.Duration(backoff * retryJitterFraction)
+	if jitterWindow <= 0 {
+		return time.Duration(backoff)
+	}
+
+	jitter := time.Duration(rand.Int63n(int64(jitterWindow)*2+1)) - jitterWindow
+	delay := time.Duration(backoff) + jitter
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
 func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 	rq.Header.Set("Content-Type", "application/json")
 	if ft.authType == AuthTypeBasic {
@@ -303,12 +384,27 @@ func (ft *APIClient) do(rq *http.Request) (*http.Response, error) {
 	if rq.Body != nil {
 		bodyBytes, _ = io.ReadAll(rq.Body)
 		rq.Body.Close()
-		rq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	resp, err := ft.client.Do(rq)
-	if err != nil {
-		return nil, err
+	var resp *http.Response
+	var err error
+
+	for attempt := 0; ; attempt++ {
+		attemptReq := cloneRequestForAttempt(rq, bodyBytes)
+		if ft.authType == AuthTypeBasic {
+			attemptReq.SetBasicAuth(ft.Username, ft.Password)
+		}
+
+		resp, err = ft.client.Do(attemptReq)
+		if err != nil {
+			return nil, err
+		}
+		if !shouldRetryStatus(resp.StatusCode) || attempt >= maxRetryAttempts {
+			break
+		}
+
+		resp.Body.Close()
+		time.Sleep(retryDelay(resp, attempt))
 	}
 
 	if ft.Debug {
